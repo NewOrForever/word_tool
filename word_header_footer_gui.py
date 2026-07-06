@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import queue
+import ctypes
+import importlib
+import platform
 import sys
 import threading
 import zipfile
@@ -29,12 +32,49 @@ from tkinter.ttk import Progressbar, Style
 
 from remove_word_headers_footers import collect_targets, process_docx
 
+DND_FILES = None
+TkinterDnD = None
+
+
+# 加载拖拽组件，打包后也从临时资源目录查找
+def load_tkinterdnd() -> bool:
+    global DND_FILES, TkinterDnD
+    if DND_FILES is not None and TkinterDnD is not None:
+        return True
+
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir and bundle_dir not in sys.path:
+        sys.path.insert(0, bundle_dir)
+
+    try:
+        module = importlib.import_module("tkinterdnd2")
+    except Exception:
+        return False
+
+    DND_FILES = module.DND_FILES
+    TkinterDnD = module.TkinterDnD
+    return True
+
+
+# 创建主窗口，拖拽窗口创建失败时退回普通窗口
+def create_root_window() -> Tk:
+    if not load_tkinterdnd():
+        return Tk()
+
+    try:
+        return TkinterDnD.Tk()
+    except Exception:
+        return Tk()
+
 
 APP_TITLE = "Word 页眉页脚清理工具"
 MODE_LABELS = {
     "header": "只去页眉",
     "footer": "只去页脚",
     "both": "页眉页脚都去",
+    "set_header": "修改/增加页眉",
+    "set_footer": "修改/增加页脚",
+    "set_both": "页眉页脚都修改",
 }
 
 
@@ -49,8 +89,14 @@ class HeaderFooterCleanerApp:
     recursive_var: BooleanVar
     # 当前处理类型变量
     target_type_var: StringVar
+    # 页眉内容变量
+    header_text_var: StringVar
+    # 页脚内容变量
+    footer_text_var: StringVar
     # 工作线程消息队列
     message_queue: queue.Queue
+    # 拖拽回调保存列表
+    drop_callbacks: list[object]
 
     # 初始化界面和状态
     def __init__(self, root: Tk) -> None:
@@ -59,7 +105,10 @@ class HeaderFooterCleanerApp:
         self.mode_var = StringVar(value="both")
         self.recursive_var = BooleanVar(value=True)
         self.target_type_var = StringVar(value="folder")
+        self.header_text_var = StringVar()
+        self.footer_text_var = StringVar()
         self.message_queue = queue.Queue()
+        self.drop_callbacks = []
         self.worker_thread: threading.Thread | None = None
 
         self.root.title(APP_TITLE)
@@ -69,6 +118,7 @@ class HeaderFooterCleanerApp:
 
         self._configure_style()
         self._build_ui()
+        self._enable_drop_upload()
         self._poll_messages()
 
     # 设置窗口控件样式
@@ -132,6 +182,9 @@ class HeaderFooterCleanerApp:
 
         Button(path_row, text="选择", width=10, command=self._choose_target).pack(side="left", padx=(8, 0))
 
+        drop_hint = Label(panel, text="也可以把 Word 文件或文件夹拖到窗口里", fg="#777777")
+        drop_hint.pack(anchor="w", pady=(8, 0))
+
     # 创建处理选项区域
     def _build_options_panel(self, parent: Frame) -> None:
         panel = LabelFrame(parent, text="处理选项", padx=12, pady=10)
@@ -142,6 +195,20 @@ class HeaderFooterCleanerApp:
 
         for mode, label in MODE_LABELS.items():
             Radiobutton(mode_row, text=label, value=mode, variable=self.mode_var).pack(side="left", padx=(0, 18))
+
+        header_row = Frame(panel)
+        header_row.pack(fill="x", pady=(10, 0))
+
+        Label(header_row, text="页眉内容", width=8, anchor="w").pack(side="left")
+        self.header_entry = Entry(header_row, textvariable=self.header_text_var)
+        self.header_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        footer_row = Frame(panel)
+        footer_row.pack(fill="x", pady=(8, 0))
+
+        Label(footer_row, text="页脚内容", width=8, anchor="w").pack(side="left")
+        self.footer_entry = Entry(footer_row, textvariable=self.footer_text_var)
+        self.footer_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         recursive_row = Frame(panel)
         recursive_row.pack(fill="x", pady=(10, 0))
@@ -200,7 +267,131 @@ class HeaderFooterCleanerApp:
             selected = filedialog.askdirectory(title="选择 Word 文件夹")
 
         if selected:
-            self.target_var.set(selected)
+            self._set_target_from_path(Path(selected))
+
+    # 启用 Windows 文件拖拽上传
+    def _enable_drop_upload(self) -> None:
+        if self._enable_tkinterdnd_upload():
+            return
+        self._enable_windows_drop_upload()
+
+    # 启用 TkDND 文件拖拽上传
+    def _enable_tkinterdnd_upload(self) -> bool:
+        if not load_tkinterdnd():
+            return False
+
+        registered = False
+        for widget in self._iter_widgets(self.root):
+            if not hasattr(widget, "drop_target_register"):
+                continue
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._handle_drop_event)
+                registered = True
+            except Exception:
+                continue
+        return registered
+
+    # 处理 TkDND 拖拽事件
+    def _handle_drop_event(self, event) -> None:
+        self._handle_dropped_paths(self._parse_dropped_paths(event.data))
+
+    # 解析拖拽事件中的路径列表
+    def _parse_dropped_paths(self, data: str) -> list[str]:
+        try:
+            return [path for path in self.root.tk.splitlist(data) if path]
+        except Exception:
+            return [data] if data else []
+
+    # 启用 Windows 原生文件拖拽上传
+    def _enable_windows_drop_upload(self) -> None:
+        if sys.platform != "win32":
+            return
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return
+
+        WM_DROPFILES = 0x0233
+        GWLP_WNDPROC = -4
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+        set_window_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+        call_window_proc = user32.CallWindowProcW
+        set_window_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        set_window_long.restype = ctypes.c_void_p
+        call_window_proc.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        call_window_proc.restype = LRESULT
+
+        # 所有主要控件都接收拖拽，避免拖到输入框或日志区时失效
+        self.root.update_idletasks()
+        seen_hwnds: set[int] = set()
+        for widget in self._iter_widgets(self.root):
+            try:
+                hwnd = widget.winfo_id()
+                if hwnd in seen_hwnds:
+                    continue
+                seen_hwnds.add(hwnd)
+                shell32.DragAcceptFiles(hwnd, True)
+            except Exception:
+                continue
+
+            old_proc_holder: list[ctypes.c_void_p] = [ctypes.c_void_p()]
+
+            def drop_proc(hwnd_param, message, w_param, l_param, old_proc_holder=old_proc_holder):
+                if message == WM_DROPFILES:
+                    paths = self._read_drop_paths(shell32, w_param)
+                    shell32.DragFinish(w_param)
+                    self.root.after(0, lambda: self._handle_dropped_paths(paths))
+                    return 0
+                return call_window_proc(old_proc_holder[0], hwnd_param, message, w_param, l_param)
+
+            callback = WNDPROC(drop_proc)
+            old_proc_holder[0] = set_window_long(hwnd, GWLP_WNDPROC, ctypes.cast(callback, ctypes.c_void_p))
+            self.drop_callbacks.append(callback)
+
+    # 遍历窗口中的全部控件
+    def _iter_widgets(self, widget) -> list:
+        widgets = [widget]
+        for child in widget.winfo_children():
+            widgets.extend(self._iter_widgets(child))
+        return widgets
+
+    # 读取系统拖拽消息里的路径列表
+    def _read_drop_paths(self, shell32, drop_handle) -> list[str]:
+        count = shell32.DragQueryFileW(drop_handle, 0xFFFFFFFF, None, 0)
+        paths: list[str] = []
+        for index in range(count):
+            length = shell32.DragQueryFileW(drop_handle, index, None, 0) + 1
+            buffer = ctypes.create_unicode_buffer(length)
+            shell32.DragQueryFileW(drop_handle, index, buffer, length)
+            paths.append(buffer.value)
+        return paths
+
+    # 处理拖拽进来的文件或文件夹路径
+    def _handle_dropped_paths(self, paths: list[str]) -> None:
+        if not paths:
+            return
+
+        self._set_target_from_path(Path(paths[0]))
+        if len(paths) > 1:
+            self._append_log("已选择第一个拖入的文件或文件夹")
+
+    # 根据路径自动切换文件或文件夹模式
+    def _set_target_from_path(self, target: Path) -> None:
+        if target.is_dir():
+            self.target_type_var.set("folder")
+            self.target_var.set(str(target))
+            return
+        if target.is_file():
+            self.target_type_var.set("file")
+            self.target_var.set(str(target))
+            return
+        messagebox.showwarning("路径不正确", "拖入的路径不是有效的文件或文件夹")
 
     # 校验用户输入
     def _validate_target(self) -> Path | None:
@@ -216,6 +407,13 @@ class HeaderFooterCleanerApp:
         if self.target_type_var.get() == "folder" and not target.is_dir():
             messagebox.showwarning("路径不正确", "请选择一个有效的文件夹")
             return None
+        mode = self.mode_var.get()
+        if mode in {"set_header", "set_both"} and not self.header_text_var.get().strip():
+            messagebox.showwarning("缺少页眉内容", "请填写要写入的页眉内容")
+            return None
+        if mode in {"set_footer", "set_both"} and not self.footer_text_var.get().strip():
+            messagebox.showwarning("缺少页脚内容", "请填写要写入的页脚内容")
+            return None
 
         return target.resolve()
 
@@ -226,6 +424,8 @@ class HeaderFooterCleanerApp:
             return
 
         mode = self.mode_var.get()
+        header_text = self.header_text_var.get().strip() if mode in {"set_header", "set_both"} else None
+        footer_text = self.footer_text_var.get().strip() if mode in {"set_footer", "set_both"} else None
         recursive = bool(self.recursive_var.get()) and self.target_type_var.get() == "folder"
 
         self.start_button.config(state=DISABLED)
@@ -234,18 +434,29 @@ class HeaderFooterCleanerApp:
         self.log_text.delete("1.0", END)
         self._append_log(f"处理模式：{MODE_LABELS[mode]}")
         self._append_log(f"处理路径：{target}")
+        if header_text is not None:
+            self._append_log(f"页眉内容：{header_text}")
+        if footer_text is not None:
+            self._append_log(f"页脚内容：{footer_text}")
         self._append_log("提示：处理完成后会直接覆盖原文件")
 
         # 后台线程执行文件处理，避免界面卡住
         self.worker_thread = threading.Thread(
             target=self._run_processing,
-            args=(target, mode, recursive),
+            args=(target, mode, recursive, header_text, footer_text),
             daemon=True,
         )
         self.worker_thread.start()
 
     # 后台执行 Word 处理
-    def _run_processing(self, target: Path, mode: str, recursive: bool) -> None:
+    def _run_processing(
+        self,
+        target: Path,
+        mode: str,
+        recursive: bool,
+        header_text: str | None,
+        footer_text: str | None,
+    ) -> None:
         try:
             targets = collect_targets(target, recursive)
             if not targets:
@@ -257,7 +468,7 @@ class HeaderFooterCleanerApp:
             total = len(targets)
 
             for index, source in enumerate(targets, start=1):
-                result = process_docx(source, mode, None, True)
+                result = process_docx(source, mode, None, True, header_text=header_text, footer_text=footer_text)
                 if result.changed:
                     success_count += 1
                     self.message_queue.put(("log", f"[成功] {source}"))
@@ -306,6 +517,14 @@ class HeaderFooterCleanerApp:
 
 # 执行无界面的自检逻辑
 def run_self_test() -> int:
+    if not load_tkinterdnd():
+        print("SELF TEST FAIL: 拖拽组件未加载")
+        return 1
+
+    root = create_root_window()
+    root.withdraw()
+    root.destroy()
+
     sample_dir = Path("work/gui_self_test")
     source = sample_dir / "sample.docx"
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -383,7 +602,7 @@ def main() -> int:
     if "--self-test" in sys.argv:
         return run_self_test()
 
-    root = Tk()
+    root = create_root_window()
     HeaderFooterCleanerApp(root)
     root.mainloop()
     return 0

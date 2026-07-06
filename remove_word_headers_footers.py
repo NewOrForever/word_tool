@@ -11,7 +11,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Callable, Iterable
 from xml.etree import ElementTree as ET
 
 
@@ -20,9 +20,30 @@ REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 REL_ATTR = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+WORD_TYPE_ATTR = f"{{{WORD_NS}}}type"
 HEADER_REL_TYPE = f"{OFFICE_REL_NS}/header"
 FOOTER_REL_TYPE = f"{OFFICE_REL_NS}/footer"
+HEADER_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"
+FOOTER_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
 WORD_EXTENSIONS = {".docx", ".docm", ".dotx", ".dotm"}
+HEADER_FOOTER_CONFIGS = {
+    "header": {
+        "xml_tag": "hdr",
+        "reference_tag": "headerReference",
+        "part_prefix": "header",
+        "rel_id_prefix": "rIdHeader",
+        "rel_type": HEADER_REL_TYPE,
+        "content_type": HEADER_CONTENT_TYPE,
+    },
+    "footer": {
+        "xml_tag": "ftr",
+        "reference_tag": "footerReference",
+        "part_prefix": "footer",
+        "rel_id_prefix": "rIdFooter",
+        "rel_type": FOOTER_REL_TYPE,
+        "content_type": FOOTER_CONTENT_TYPE,
+    },
+}
 
 
 ET.register_namespace("w", WORD_NS)
@@ -68,12 +89,171 @@ def should_remove(kind: str, mode: str) -> bool:
     return mode == "both" or mode == kind
 
 
+# 生成只包含指定文本的页眉或页脚 XML
+def build_header_footer_xml(kind: str, text_value: str) -> bytes:
+    wrapper = ET.Element(f"{{{WORD_NS}}}{HEADER_FOOTER_CONFIGS[kind]['xml_tag']}")
+    paragraph = ET.SubElement(wrapper, f"{{{WORD_NS}}}p")
+    paragraph_props = ET.SubElement(paragraph, f"{{{WORD_NS}}}pPr")
+    ET.SubElement(paragraph_props, f"{{{WORD_NS}}}jc", {f"{{{WORD_NS}}}val": "right"})
+    run = ET.SubElement(paragraph, f"{{{WORD_NS}}}r")
+    text = ET.SubElement(run, f"{{{WORD_NS}}}t")
+    text.text = text_value
+    if text_value != text_value.strip() or "\n" in text_value:
+        text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    return xml_to_bytes(wrapper)
+
+
 # 把关系文件里的 Target 转成 docx 内部路径
 def relationship_target_to_zip_path(target: str) -> str:
     target_path = PurePosixPath(target)
     if target_path.is_absolute():
         return str(target_path).lstrip("/")
     return str(PurePosixPath("word") / target_path)
+
+
+# 收集关系文件中已经存在的页眉或页脚文件路径
+def collect_header_footer_targets(rels_xml: bytes, kind: str) -> set[str]:
+    root = parse_xml(rels_xml)
+    targets: set[str] = set()
+    rel_type = HEADER_FOOTER_CONFIGS[kind]["rel_type"]
+
+    # 关系的 Target 指向文档包里的实际页眉或页脚文件
+    for relationship in root:
+        if relationship.attrib.get("Type", "") == rel_type:
+            rel_target = relationship.attrib.get("Target", "")
+            if rel_target:
+                targets.add(relationship_target_to_zip_path(rel_target))
+
+    return targets
+
+
+# 生成不和现有文件冲突的页眉或页脚文件路径
+def build_header_footer_part_name(kind: str, existing_names: set[str]) -> str:
+    part_prefix = HEADER_FOOTER_CONFIGS[kind]["part_prefix"]
+    index = 1
+    while True:
+        candidate = f"word/{part_prefix}{index}.xml"
+        if candidate not in existing_names:
+            return candidate
+        index += 1
+
+
+# 生成不和现有关系冲突的关系编号
+def build_relationship_id(kind: str, root: ET.Element) -> str:
+    rel_id_prefix = HEADER_FOOTER_CONFIGS[kind]["rel_id_prefix"]
+    existing_ids = {child.attrib.get("Id", "") for child in root}
+    if rel_id_prefix not in existing_ids:
+        return rel_id_prefix
+
+    index = 1
+    while f"{rel_id_prefix}{index}" in existing_ids:
+        index += 1
+    return f"{rel_id_prefix}{index}"
+
+
+# 给关系文件新增页眉或页脚关系
+def add_header_footer_relationship(rels_xml: bytes, kind: str, rel_id: str, part_name: str) -> bytes:
+    root = parse_xml(rels_xml)
+    ET.SubElement(
+        root,
+        f"{{{REL_NS}}}Relationship",
+        {
+            "Id": rel_id,
+            "Type": HEADER_FOOTER_CONFIGS[kind]["rel_type"],
+            "Target": PurePosixPath(part_name).name,
+        },
+    )
+    return xml_to_bytes(root)
+
+
+# 确保正文分节设置引用指定页眉或页脚
+def ensure_header_footer_reference(document_xml: bytes, kind: str, rel_id: str) -> tuple[bytes, bool]:
+    root = parse_xml(document_xml)
+    body = root.find(f".//{{{WORD_NS}}}body")
+    if body is None:
+        return document_xml, False
+
+    changed = False
+    sections = list(root.iter(f"{{{WORD_NS}}}sectPr"))
+    reference_tag = HEADER_FOOTER_CONFIGS[kind]["reference_tag"]
+    if not sections:
+        sections = [ET.SubElement(body, f"{{{WORD_NS}}}sectPr")]
+        changed = True
+
+    # 每个分节都要有默认引用，避免只有部分页面生效
+    for section in sections:
+        default_reference = None
+        for child in section:
+            if child.tag.rsplit("}", 1)[-1] == reference_tag and child.attrib.get(WORD_TYPE_ATTR, "default") == "default":
+                default_reference = child
+                break
+        if default_reference is None:
+            default_reference = ET.Element(f"{{{WORD_NS}}}{reference_tag}", {WORD_TYPE_ATTR: "default", REL_ATTR: rel_id})
+            section.insert(0, default_reference)
+            changed = True
+        elif default_reference.attrib.get(REL_ATTR) != rel_id:
+            default_reference.set(REL_ATTR, rel_id)
+            changed = True
+
+    return xml_to_bytes(root), changed
+
+
+# 确保内容类型表声明了页眉或页脚文件
+def ensure_content_type_override(content_types_xml: bytes, kind: str, part_name: str) -> tuple[bytes, bool]:
+    root = parse_xml(content_types_xml)
+    normalized_part_name = f"/{part_name.lstrip('/')}"
+
+    for child in root:
+        if child.tag.rsplit("}", 1)[-1] == "Override" and child.attrib.get("PartName") == normalized_part_name:
+            return content_types_xml, False
+
+    ET.SubElement(
+        root,
+        f"{{{CONTENT_TYPES_NS}}}Override",
+        {
+            "PartName": normalized_part_name,
+            "ContentType": HEADER_FOOTER_CONFIGS[kind]["content_type"],
+        },
+    )
+    return xml_to_bytes(root), True
+
+
+# 准备页眉或页脚修改所需的包内文件替换
+def prepare_header_footer_update(
+    document_xml: bytes,
+    rels_xml: bytes,
+    names: set[str],
+    replacements: dict[str, bytes],
+    new_files: dict[str, bytes],
+    kind: str,
+    text_value: str,
+    read_file: Callable[[str], bytes],
+) -> tuple[bytes, bytes, set[str], bool]:
+    part_bytes = build_header_footer_xml(kind, text_value)
+    part_targets = collect_header_footer_targets(rels_xml, kind)
+    changed = False
+
+    # 已存在时替换原有文件，不存在时补齐文件、关系和正文引用
+    if part_targets:
+        for part_target in part_targets:
+            if part_target not in names or read_file(part_target) != part_bytes:
+                changed = True
+            if part_target in names:
+                replacements[part_target] = part_bytes
+            else:
+                new_files[part_target] = part_bytes
+    else:
+        known_names = names | set(new_files)
+        part_name = build_header_footer_part_name(kind, known_names)
+        rels_root = parse_xml(rels_xml)
+        rel_id = build_relationship_id(kind, rels_root)
+        document_xml, document_changed = ensure_header_footer_reference(document_xml, kind, rel_id)
+        rels_xml = add_header_footer_relationship(rels_xml, kind, rel_id, part_name)
+        new_files[part_name] = part_bytes
+        part_targets = {part_name}
+        changed = True or document_changed
+
+    return document_xml, rels_xml, part_targets, changed
 
 
 # 移除 document.xml 中的页眉或页脚引用
@@ -158,6 +338,9 @@ def build_output_path(source: Path, output_dir: Path | None, mode: str) -> Path:
         "header": "no_header",
         "footer": "no_footer",
         "both": "no_header_footer",
+        "set_header": "header_updated",
+        "set_footer": "footer_updated",
+        "set_both": "header_footer_updated",
     }
     target_dir = output_dir if output_dir else source.parent
     candidate = target_dir / f"{source.stem}_{suffix_map[mode]}{source.suffix}"
@@ -174,6 +357,8 @@ def process_docx(
     mode: str,
     output_dir: Path | None,
     in_place: bool,
+    header_text: str | None = None,
+    footer_text: str | None = None,
 ) -> ProcessResult:
     if source.name.startswith("~$"):
         return ProcessResult(source, None, False, "跳过 Word 临时文件")
@@ -194,32 +379,94 @@ def process_docx(
                 return ProcessResult(source, None, False, "文件结构不完整")
 
             replacements: dict[str, bytes] = {}
+            new_files: dict[str, bytes] = {}
             removed_parts: set[str] = set()
+            text_changed = False
+            document_bytes = zin.read("word/document.xml")
+            rels_bytes = zin.read("word/_rels/document.xml.rels")
 
-            document_bytes, _removed_ids, document_changed = remove_section_references(
-                zin.read("word/document.xml"),
-                mode,
-            )
-            rels_bytes, rel_removed_parts, rels_changed = remove_document_relationships(
-                zin.read("word/_rels/document.xml.rels"),
-                mode,
-            )
-            replacements["word/document.xml"] = document_bytes
-            replacements["word/_rels/document.xml.rels"] = rels_bytes
-            removed_parts.update(rel_removed_parts)
+            if header_text is None and footer_text is None:
+                document_bytes, _removed_ids, document_changed = remove_section_references(
+                    document_bytes,
+                    mode,
+                )
+                rels_bytes, rel_removed_parts, rels_changed = remove_document_relationships(
+                    rels_bytes,
+                    mode,
+                )
+                replacements["word/document.xml"] = document_bytes
+                replacements["word/_rels/document.xml.rels"] = rels_bytes
+                removed_parts.update(rel_removed_parts)
+            else:
+                document_changed = False
+                rels_changed = False
+                all_part_targets: set[str] = set()
+
+                if header_text is not None:
+                    old_document_bytes = document_bytes
+                    old_rels_bytes = rels_bytes
+                    document_bytes, rels_bytes, header_targets, header_changed = prepare_header_footer_update(
+                        document_bytes,
+                        rels_bytes,
+                        names,
+                        replacements,
+                        new_files,
+                        "header",
+                        header_text,
+                        zin.read,
+                    )
+                    document_changed = document_changed or document_bytes != old_document_bytes
+                    rels_changed = rels_changed or rels_bytes != old_rels_bytes
+                    text_changed = text_changed or header_changed
+                    all_part_targets.update(header_targets)
+
+                if footer_text is not None:
+                    old_document_bytes = document_bytes
+                    old_rels_bytes = rels_bytes
+                    document_bytes, rels_bytes, footer_targets, footer_changed = prepare_header_footer_update(
+                        document_bytes,
+                        rels_bytes,
+                        names,
+                        replacements,
+                        new_files,
+                        "footer",
+                        footer_text,
+                        zin.read,
+                    )
+                    document_changed = document_changed or document_bytes != old_document_bytes
+                    rels_changed = rels_changed or rels_bytes != old_rels_bytes
+                    text_changed = text_changed or footer_changed
+                    all_part_targets.update(footer_targets)
+
+                replacements["word/document.xml"] = document_bytes
+                replacements["word/_rels/document.xml.rels"] = rels_bytes
 
             if "[Content_Types].xml" in names:
-                content_types_bytes, content_types_changed = remove_content_type_overrides(
-                    zin.read("[Content_Types].xml"),
-                    removed_parts,
-                )
+                if header_text is None and footer_text is None:
+                    content_types_bytes, content_types_changed = remove_content_type_overrides(
+                        zin.read("[Content_Types].xml"),
+                        removed_parts,
+                    )
+                else:
+                    content_types_bytes = zin.read("[Content_Types].xml")
+                    content_types_changed = False
+                    for part_target in all_part_targets:
+                        kind = "header" if PurePosixPath(part_target).name.startswith("header") else "footer"
+                        content_types_bytes, current_changed = ensure_content_type_override(
+                            content_types_bytes,
+                            kind,
+                            part_target,
+                        )
+                        content_types_changed = content_types_changed or current_changed
                 replacements["[Content_Types].xml"] = content_types_bytes
             else:
                 content_types_changed = False
 
-            changed = document_changed or rels_changed or content_types_changed or bool(removed_parts)
+            changed = document_changed or rels_changed or content_types_changed or text_changed or bool(removed_parts)
             if not changed:
-                return ProcessResult(source, None, False, "没有找到需要移除的页眉页脚")
+                if header_text is None and footer_text is None:
+                    return ProcessResult(source, None, False, "没有找到需要移除的页眉页脚")
+                return ProcessResult(source, None, False, "页眉页脚内容已经一致")
 
             removed_paths = collect_removed_paths(removed_parts)
 
@@ -232,6 +479,9 @@ def process_docx(
                         zout.writestr(item, replacements[item.filename])
                     else:
                         zout.writestr(item, zin.read(item.filename))
+                for filename, data in new_files.items():
+                    if filename not in names:
+                        zout.writestr(filename, data)
 
         shutil.move(str(temp_output), str(output))
 
@@ -278,9 +528,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("target", help="单个新版 Word 文件路径，或包含新版 Word 文件的目录路径")
     parser.add_argument(
         "--mode",
-        choices=("header", "footer", "both"),
+        choices=("header", "footer", "both", "set_header", "set_footer", "set_both"),
         default="both",
-        help="header 只去页眉，footer 只去页脚，both 两者都去，默认 both",
+        help="header 只去页眉，footer 只去页脚，both 两者都去，set_header 修改或新增页眉，set_footer 修改或新增页脚，set_both 两者都修改，默认 both",
+    )
+    parser.add_argument(
+        "--header-text",
+        help="要写入的页眉内容，填写后会修改或新增页眉",
+    )
+    parser.add_argument(
+        "--footer-text",
+        help="要写入的页脚内容，填写后会修改或新增页脚",
     )
     parser.add_argument(
         "--recursive",
@@ -315,6 +573,21 @@ def main() -> int:
 
     in_place = args.in_place or output_dir is None
 
+    mode = args.mode
+    if args.header_text is not None and args.footer_text is not None:
+        mode = "set_both"
+    elif args.header_text is not None:
+        mode = "set_header"
+    elif args.footer_text is not None:
+        mode = "set_footer"
+
+    if mode == "set_header" and args.header_text is None:
+        parser.error("使用 set_header 模式时必须填写 --header-text")
+    if mode == "set_footer" and args.footer_text is None:
+        parser.error("使用 set_footer 模式时必须填写 --footer-text")
+    if mode == "set_both" and (args.header_text is None or args.footer_text is None):
+        parser.error("使用 set_both 模式时必须同时填写 --header-text 和 --footer-text")
+
     try:
         targets = collect_targets(target, args.recursive)
     except FileNotFoundError as exc:
@@ -328,9 +601,11 @@ def main() -> int:
     results = [
         process_docx(
             source,
-            args.mode,
+            mode,
             output_dir,
             in_place,
+            header_text=args.header_text,
+            footer_text=args.footer_text,
         )
         for source in targets
     ]
