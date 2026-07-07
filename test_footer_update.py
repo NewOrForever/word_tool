@@ -23,7 +23,6 @@ class HeaderFooterUpdateTests(unittest.TestCase):
             self.assertTrue(result.changed)
             self.assert_zip_contains(source, "word/header1.xml", "新的页眉")
             self.assert_zip_not_contains(source, "word/header1.xml", "旧页眉")
-            self.assert_zip_contains(source, "word/header1.xml", 'w:val="right"')
             self.assert_zip_contains(source, "word/document.xml", "headerReference")
 
     # 验证没有页眉时会自动新增页眉
@@ -36,7 +35,6 @@ class HeaderFooterUpdateTests(unittest.TestCase):
 
             self.assertTrue(result.changed)
             self.assert_zip_contains(source, "word/header1.xml", "新增页眉")
-            self.assert_zip_contains(source, "word/header1.xml", 'w:val="right"')
             self.assert_zip_contains(source, "word/document.xml", "headerReference")
             self.assert_zip_contains(source, "word/_rels/document.xml.rels", "header1.xml")
             self.assert_zip_contains(source, "[Content_Types].xml", "/word/header1.xml")
@@ -52,7 +50,6 @@ class HeaderFooterUpdateTests(unittest.TestCase):
             self.assertTrue(result.changed)
             self.assert_zip_contains(source, "word/footer1.xml", "新的页脚")
             self.assert_zip_not_contains(source, "word/footer1.xml", "旧页脚")
-            self.assert_zip_contains(source, "word/footer1.xml", 'w:val="right"')
             self.assert_zip_contains(source, "word/document.xml", "footerReference")
 
     # 验证没有页脚时会自动新增页脚
@@ -65,7 +62,6 @@ class HeaderFooterUpdateTests(unittest.TestCase):
 
             self.assertTrue(result.changed)
             self.assert_zip_contains(source, "word/footer1.xml", "新增页脚")
-            self.assert_zip_contains(source, "word/footer1.xml", 'w:val="right"')
             self.assert_zip_contains(source, "word/document.xml", "footerReference")
             self.assert_zip_contains(source, "word/_rels/document.xml.rels", "footer1.xml")
             self.assert_zip_contains(source, "[Content_Types].xml", "/word/footer1.xml")
@@ -87,9 +83,7 @@ class HeaderFooterUpdateTests(unittest.TestCase):
 
             self.assertTrue(result.changed)
             self.assert_zip_contains(source, "word/header1.xml", "一起改页眉")
-            self.assert_zip_contains(source, "word/header1.xml", 'w:val="right"')
             self.assert_zip_contains(source, "word/footer1.xml", "一起改页脚")
-            self.assert_zip_contains(source, "word/footer1.xml", 'w:val="right"')
 
     # 判断压缩包内指定文件包含目标文本
     def assert_zip_contains(self, source: Path, name: str, text: str) -> None:

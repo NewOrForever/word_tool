@@ -93,8 +93,6 @@ def should_remove(kind: str, mode: str) -> bool:
 def build_header_footer_xml(kind: str, text_value: str) -> bytes:
     wrapper = ET.Element(f"{{{WORD_NS}}}{HEADER_FOOTER_CONFIGS[kind]['xml_tag']}")
     paragraph = ET.SubElement(wrapper, f"{{{WORD_NS}}}p")
-    paragraph_props = ET.SubElement(paragraph, f"{{{WORD_NS}}}pPr")
-    ET.SubElement(paragraph_props, f"{{{WORD_NS}}}jc", {f"{{{WORD_NS}}}val": "right"})
     run = ET.SubElement(paragraph, f"{{{WORD_NS}}}r")
     text = ET.SubElement(run, f"{{{WORD_NS}}}t")
     text.text = text_value
