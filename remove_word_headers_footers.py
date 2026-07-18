@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import posixpath
 import shutil
 import sys
 import tempfile
@@ -26,6 +27,8 @@ FOOTER_REL_TYPE = f"{OFFICE_REL_NS}/footer"
 HEADER_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"
 FOOTER_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
 WORD_EXTENSIONS = {".docx", ".docm", ".dotx", ".dotm"}
+# 支持的页眉页脚对齐方式
+ALIGNMENT_VALUES = {"left", "center", "right"}
 HEADER_FOOTER_CONFIGS = {
     "header": {
         "xml_tag": "hdr",
@@ -90,15 +93,83 @@ def should_remove(kind: str, mode: str) -> bool:
 
 
 # 生成只包含指定文本的页眉或页脚 XML
-def build_header_footer_xml(kind: str, text_value: str) -> bytes:
+def build_header_footer_xml(kind: str, text_value: str, alignment: str) -> bytes:
+    if alignment not in ALIGNMENT_VALUES:
+        raise ValueError(f"不支持的对齐方式：{alignment}")
     wrapper = ET.Element(f"{{{WORD_NS}}}{HEADER_FOOTER_CONFIGS[kind]['xml_tag']}")
     paragraph = ET.SubElement(wrapper, f"{{{WORD_NS}}}p")
+    paragraph_properties = ET.SubElement(paragraph, f"{{{WORD_NS}}}pPr")
+    ET.SubElement(paragraph_properties, f"{{{WORD_NS}}}jc", {f"{{{WORD_NS}}}val": alignment})
     run = ET.SubElement(paragraph, f"{{{WORD_NS}}}r")
     text = ET.SubElement(run, f"{{{WORD_NS}}}t")
     text.text = text_value
     if text_value != text_value.strip() or "\n" in text_value:
         text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
     return xml_to_bytes(wrapper)
+
+
+# 获取部件自己的关系文件路径
+def build_part_relationship_path(part_name: str) -> str:
+    clean_part = part_name.lstrip("/")
+    rel_path = PurePosixPath(clean_part)
+    return str(rel_path.parent / "_rels" / f"{rel_path.name}.rels")
+
+
+# 把部件关系中的相对目标转换成文档包内路径
+def resolve_relationship_target(relationship_path: str, target: str) -> str:
+    clean_target = target.replace("\\", "/")
+    if clean_target.startswith("/"):
+        return posixpath.normpath(clean_target.lstrip("/"))
+
+    rel_path = PurePosixPath(relationship_path)
+    owner_directory = rel_path.parent.parent
+    return posixpath.normpath(str(owner_directory / clean_target))
+
+
+# 收集替换页眉页脚后不再使用的关系文件和图片
+def collect_obsolete_part_files(source_zip: zipfile.ZipFile, updated_parts: set[str]) -> set[str]:
+    names = set(source_zip.namelist())
+    removed_relationships = {
+        relationship_path
+        for part in updated_parts
+        if (relationship_path := build_part_relationship_path(part)) in names
+    }
+    candidate_images: set[str] = set()
+
+    for relationship_path in removed_relationships:
+        try:
+            root = parse_xml(source_zip.read(relationship_path))
+        except (KeyError, ET.ParseError):
+            continue
+        for relationship in root:
+            if relationship.attrib.get("TargetMode") == "External":
+                continue
+            if not relationship.attrib.get("Type", "").endswith("/image"):
+                continue
+            target = relationship.attrib.get("Target", "")
+            if target:
+                candidate_images.add(resolve_relationship_target(relationship_path, target))
+
+    remaining_targets: set[str] = set()
+    for relationship_path in names:
+        if not relationship_path.endswith(".rels") or relationship_path in removed_relationships:
+            continue
+        try:
+            root = parse_xml(source_zip.read(relationship_path))
+        except (KeyError, ET.ParseError):
+            return removed_relationships
+        for relationship in root:
+            if relationship.attrib.get("TargetMode") == "External":
+                continue
+            target = relationship.attrib.get("Target", "")
+            if target:
+                remaining_targets.add(resolve_relationship_target(relationship_path, target))
+
+    return removed_relationships | {
+        image_path
+        for image_path in candidate_images
+        if image_path in names and image_path not in remaining_targets
+    }
 
 
 # 把关系文件里的 Target 转成 docx 内部路径
@@ -225,9 +296,10 @@ def prepare_header_footer_update(
     new_files: dict[str, bytes],
     kind: str,
     text_value: str,
+    alignment: str,
     read_file: Callable[[str], bytes],
 ) -> tuple[bytes, bytes, set[str], bool]:
-    part_bytes = build_header_footer_xml(kind, text_value)
+    part_bytes = build_header_footer_xml(kind, text_value, alignment)
     part_targets = collect_header_footer_targets(rels_xml, kind)
     changed = False
 
@@ -325,8 +397,7 @@ def collect_removed_paths(removed_parts: set[str]) -> set[str]:
     for part in removed_parts:
         clean_part = part.lstrip("/")
         removed_paths.add(clean_part)
-        rel_path = PurePosixPath(clean_part)
-        removed_paths.add(str(rel_path.parent / "_rels" / f"{rel_path.name}.rels"))
+        removed_paths.add(build_part_relationship_path(clean_part))
     return removed_paths
 
 
@@ -357,6 +428,8 @@ def process_docx(
     in_place: bool,
     header_text: str | None = None,
     footer_text: str | None = None,
+    header_alignment: str = "left",
+    footer_alignment: str = "right",
 ) -> ProcessResult:
     if source.name.startswith("~$"):
         return ProcessResult(source, None, False, "跳过 Word 临时文件")
@@ -379,6 +452,7 @@ def process_docx(
             replacements: dict[str, bytes] = {}
             new_files: dict[str, bytes] = {}
             removed_parts: set[str] = set()
+            obsolete_paths: set[str] = set()
             text_changed = False
             document_bytes = zin.read("word/document.xml")
             rels_bytes = zin.read("word/_rels/document.xml.rels")
@@ -399,6 +473,7 @@ def process_docx(
                 document_changed = False
                 rels_changed = False
                 all_part_targets: set[str] = set()
+                updated_part_targets: set[str] = set()
 
                 if header_text is not None:
                     old_document_bytes = document_bytes
@@ -411,12 +486,14 @@ def process_docx(
                         new_files,
                         "header",
                         header_text,
+                        header_alignment,
                         zin.read,
                     )
                     document_changed = document_changed or document_bytes != old_document_bytes
                     rels_changed = rels_changed or rels_bytes != old_rels_bytes
                     text_changed = text_changed or header_changed
                     all_part_targets.update(header_targets)
+                    updated_part_targets.update(header_targets)
 
                 if footer_text is not None:
                     old_document_bytes = document_bytes
@@ -429,12 +506,17 @@ def process_docx(
                         new_files,
                         "footer",
                         footer_text,
+                        footer_alignment,
                         zin.read,
                     )
                     document_changed = document_changed or document_bytes != old_document_bytes
                     rels_changed = rels_changed or rels_bytes != old_rels_bytes
                     text_changed = text_changed or footer_changed
                     all_part_targets.update(footer_targets)
+                    updated_part_targets.update(footer_targets)
+
+                obsolete_paths.update(collect_obsolete_part_files(zin, updated_part_targets))
+                text_changed = text_changed or bool(obsolete_paths)
 
                 replacements["word/document.xml"] = document_bytes
                 replacements["word/_rels/document.xml.rels"] = rels_bytes
@@ -460,13 +542,20 @@ def process_docx(
             else:
                 content_types_changed = False
 
-            changed = document_changed or rels_changed or content_types_changed or text_changed or bool(removed_parts)
+            changed = (
+                document_changed
+                or rels_changed
+                or content_types_changed
+                or text_changed
+                or bool(removed_parts)
+                or bool(obsolete_paths)
+            )
             if not changed:
                 if header_text is None and footer_text is None:
                     return ProcessResult(source, None, False, "没有找到需要移除的页眉页脚")
                 return ProcessResult(source, None, False, "页眉页脚内容已经一致")
 
-            removed_paths = collect_removed_paths(removed_parts)
+            removed_paths = collect_removed_paths(removed_parts) | obsolete_paths
 
             # 复制原文档包，跳过要删除的页眉页脚文件，并替换被修改的 XML
             with zipfile.ZipFile(temp_output, "w", zipfile.ZIP_DEFLATED) as zout:

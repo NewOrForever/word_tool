@@ -10,6 +10,7 @@ import platform
 import sys
 import threading
 import zipfile
+from base64 import b64decode
 from pathlib import Path
 from tkinter import (
     BooleanVar,
@@ -28,9 +29,10 @@ from tkinter import (
     messagebox,
 )
 from tkinter.scrolledtext import ScrolledText
-from tkinter.ttk import Progressbar, Style
+from tkinter.ttk import Combobox, Progressbar, Style
+from xml.etree import ElementTree as ET
 
-from remove_word_headers_footers import collect_targets, process_docx
+from remove_word_headers_footers import WORD_NS, collect_targets, process_docx
 
 DND_FILES = None
 TkinterDnD = None
@@ -76,6 +78,16 @@ MODE_LABELS = {
     "set_footer": "修改/增加页脚",
     "set_both": "页眉页脚都修改",
 }
+# 界面位置文字和文档对齐值的对应关系
+ALIGNMENT_LABELS = {"左边": "left", "居中": "center", "右边": "right"}
+
+
+# 把界面位置文字转换成文档对齐值
+def alignment_value(label: str) -> str:
+    try:
+        return ALIGNMENT_LABELS[label]
+    except KeyError as exc:
+        raise ValueError(f"不支持的位置：{label}") from exc
 
 
 class HeaderFooterCleanerApp:
@@ -93,6 +105,10 @@ class HeaderFooterCleanerApp:
     header_text_var: StringVar
     # 页脚内容变量
     footer_text_var: StringVar
+    # 页眉位置变量
+    header_alignment_var: StringVar
+    # 页脚位置变量
+    footer_alignment_var: StringVar
     # 工作线程消息队列
     message_queue: queue.Queue
     # 拖拽回调保存列表
@@ -107,6 +123,8 @@ class HeaderFooterCleanerApp:
         self.target_type_var = StringVar(value="folder")
         self.header_text_var = StringVar()
         self.footer_text_var = StringVar()
+        self.header_alignment_var = StringVar(value="左边")
+        self.footer_alignment_var = StringVar(value="右边")
         self.message_queue = queue.Queue()
         self.drop_callbacks = []
         self.worker_thread: threading.Thread | None = None
@@ -202,6 +220,15 @@ class HeaderFooterCleanerApp:
         Label(header_row, text="页眉内容", width=8, anchor="w").pack(side="left")
         self.header_entry = Entry(header_row, textvariable=self.header_text_var)
         self.header_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        Label(header_row, text="位置", width=5, anchor="e").pack(side="left", padx=(10, 4))
+        self.header_alignment_box = Combobox(
+            header_row,
+            textvariable=self.header_alignment_var,
+            values=tuple(ALIGNMENT_LABELS),
+            state="readonly",
+            width=6,
+        )
+        self.header_alignment_box.pack(side="left")
 
         footer_row = Frame(panel)
         footer_row.pack(fill="x", pady=(8, 0))
@@ -209,6 +236,15 @@ class HeaderFooterCleanerApp:
         Label(footer_row, text="页脚内容", width=8, anchor="w").pack(side="left")
         self.footer_entry = Entry(footer_row, textvariable=self.footer_text_var)
         self.footer_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        Label(footer_row, text="位置", width=5, anchor="e").pack(side="left", padx=(10, 4))
+        self.footer_alignment_box = Combobox(
+            footer_row,
+            textvariable=self.footer_alignment_var,
+            values=tuple(ALIGNMENT_LABELS),
+            state="readonly",
+            width=6,
+        )
+        self.footer_alignment_box.pack(side="left")
 
         recursive_row = Frame(panel)
         recursive_row.pack(fill="x", pady=(10, 0))
@@ -426,6 +462,8 @@ class HeaderFooterCleanerApp:
         mode = self.mode_var.get()
         header_text = self.header_text_var.get().strip() if mode in {"set_header", "set_both"} else None
         footer_text = self.footer_text_var.get().strip() if mode in {"set_footer", "set_both"} else None
+        header_alignment = alignment_value(self.header_alignment_var.get())
+        footer_alignment = alignment_value(self.footer_alignment_var.get())
         recursive = bool(self.recursive_var.get()) and self.target_type_var.get() == "folder"
 
         self.start_button.config(state=DISABLED)
@@ -436,14 +474,16 @@ class HeaderFooterCleanerApp:
         self._append_log(f"处理路径：{target}")
         if header_text is not None:
             self._append_log(f"页眉内容：{header_text}")
+            self._append_log(f"页眉位置：{self.header_alignment_var.get()}")
         if footer_text is not None:
             self._append_log(f"页脚内容：{footer_text}")
+            self._append_log(f"页脚位置：{self.footer_alignment_var.get()}")
         self._append_log("提示：处理完成后会直接覆盖原文件")
 
         # 后台线程执行文件处理，避免界面卡住
         self.worker_thread = threading.Thread(
             target=self._run_processing,
-            args=(target, mode, recursive, header_text, footer_text),
+            args=(target, mode, recursive, header_text, footer_text, header_alignment, footer_alignment),
             daemon=True,
         )
         self.worker_thread.start()
@@ -456,6 +496,8 @@ class HeaderFooterCleanerApp:
         recursive: bool,
         header_text: str | None,
         footer_text: str | None,
+        header_alignment: str,
+        footer_alignment: str,
     ) -> None:
         try:
             targets = collect_targets(target, recursive)
@@ -468,7 +510,16 @@ class HeaderFooterCleanerApp:
             total = len(targets)
 
             for index, source in enumerate(targets, start=1):
-                result = process_docx(source, mode, None, True, header_text=header_text, footer_text=footer_text)
+                result = process_docx(
+                    source,
+                    mode,
+                    None,
+                    True,
+                    header_text=header_text,
+                    footer_text=footer_text,
+                    header_alignment=header_alignment,
+                    footer_alignment=footer_alignment,
+                )
                 if result.changed:
                     success_count += 1
                     self.message_queue.put(("log", f"[成功] {source}"))
@@ -550,6 +601,46 @@ def run_self_test() -> int:
         print("SELF TEST FAIL: 页眉被误删")
         return 1
 
+    update_source = sample_dir / "update_sample.docx"
+    create_sample_docx(update_source)
+    update_result = process_docx(
+        update_source,
+        "set_both",
+        None,
+        True,
+        header_text="测试修改页眉",
+        footer_text="测试修改页脚",
+        header_alignment="center",
+        footer_alignment="left",
+    )
+    if not update_result.changed:
+        print("SELF TEST FAIL: 未修改页眉页脚")
+        return 1
+
+    with zipfile.ZipFile(update_source) as zf:
+        update_names = set(zf.namelist())
+        header_root = ET.fromstring(zf.read("word/header1.xml"))
+        footer_root = ET.fromstring(zf.read("word/footer1.xml"))
+        footer_text = "".join(text.text or "" for text in footer_root.iter(f"{{{WORD_NS}}}t"))
+        header_alignment = header_root.find(f".//{{{WORD_NS}}}p/{{{WORD_NS}}}pPr/{{{WORD_NS}}}jc")
+        footer_alignment = footer_root.find(f".//{{{WORD_NS}}}p/{{{WORD_NS}}}pPr/{{{WORD_NS}}}jc")
+
+    if footer_text != "测试修改页脚":
+        print("SELF TEST FAIL: 页脚内容未修改")
+        return 1
+    if header_alignment is None or header_alignment.attrib.get(f"{{{WORD_NS}}}val") != "center":
+        print("SELF TEST FAIL: 页眉未居中")
+        return 1
+    if footer_alignment is None or footer_alignment.attrib.get(f"{{{WORD_NS}}}val") != "left":
+        print("SELF TEST FAIL: 页脚未左对齐")
+        return 1
+    if "word/_rels/footer1.xml.rels" in update_names:
+        print("SELF TEST FAIL: 旧页脚关联未清理")
+        return 1
+    if "word/media/old-footer.png" in update_names:
+        print("SELF TEST FAIL: 旧页脚图片未清理")
+        return 1
+
     print("SELF TEST PASS")
     return 0
 
@@ -590,11 +681,20 @@ def create_sample_docx(path: Path) -> None:
 <w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>测试页眉</w:t></w:r></w:p></w:hdr>""",
         "word/footer1.xml": """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>测试页脚</w:t></w:r></w:p></w:ftr>""",
+        "word/_rels/footer1.xml.rels": """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="file:///D:/old/image.png" TargetMode="External"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/old-footer.png"/>
+</Relationships>""",
+        "word/media/old-footer.png": b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ),
     }
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, content in files.items():
-            zf.writestr(name, content.encode("utf-8"))
+            data = content if isinstance(content, bytes) else content.encode("utf-8")
+            zf.writestr(name, data)
 
 
 # 程序入口
