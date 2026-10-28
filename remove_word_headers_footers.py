@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import posixpath
+import re
 import shutil
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 from xml.etree import ElementTree as ET
+from xml.dom import minidom
 
 
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -99,13 +101,43 @@ def build_header_footer_xml(kind: str, text_value: str, alignment: str) -> bytes
     wrapper = ET.Element(f"{{{WORD_NS}}}{HEADER_FOOTER_CONFIGS[kind]['xml_tag']}")
     paragraph = ET.SubElement(wrapper, f"{{{WORD_NS}}}p")
     paragraph_properties = ET.SubElement(paragraph, f"{{{WORD_NS}}}pPr")
+    borders = ET.SubElement(paragraph_properties, f"{{{WORD_NS}}}pBdr")
+    for edge in ("top", "left", "bottom", "right", "between", "bar"):
+        ET.SubElement(borders, f"{{{WORD_NS}}}{edge}", {f"{{{WORD_NS}}}val": "nil"})
     ET.SubElement(paragraph_properties, f"{{{WORD_NS}}}jc", {f"{{{WORD_NS}}}val": alignment})
+    for segment in re.split(r"(\{PAGE\}|\{NUMPAGES\})", text_value):
+        if segment in {"{PAGE}", "{NUMPAGES}"}:
+            append_page_field(paragraph, segment[1:-1])
+        elif segment:
+            append_text_run(paragraph, segment)
+    return xml_to_bytes(wrapper)
+
+
+# 写入普通文字并保留页码两侧的空格
+def append_text_run(paragraph: ET.Element, value: str) -> None:
     run = ET.SubElement(paragraph, f"{{{WORD_NS}}}r")
     text = ET.SubElement(run, f"{{{WORD_NS}}}t")
-    text.text = text_value
-    if text_value != text_value.strip() or "\n" in text_value:
+    text.text = value
+    if value != value.strip() or "\n" in value:
         text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-    return xml_to_bytes(wrapper)
+
+
+# 写入由 Word 根据实际排版计算的页码或总页数域
+def append_page_field(paragraph: ET.Element, instruction: str) -> None:
+    run = ET.SubElement(paragraph, f"{{{WORD_NS}}}r")
+    ET.SubElement(run, f"{{{WORD_NS}}}fldChar", {
+        f"{{{WORD_NS}}}fldCharType": "begin", f"{{{WORD_NS}}}dirty": "true",
+    })
+    run = ET.SubElement(paragraph, f"{{{WORD_NS}}}r")
+    code = ET.SubElement(run, f"{{{WORD_NS}}}instrText", {
+        "{http://www.w3.org/XML/1998/namespace}space": "preserve",
+    })
+    code.text = f" {instruction} "
+    run = ET.SubElement(paragraph, f"{{{WORD_NS}}}r")
+    ET.SubElement(run, f"{{{WORD_NS}}}fldChar", {f"{{{WORD_NS}}}fldCharType": "separate"})
+    append_text_run(paragraph, "1")
+    run = ET.SubElement(paragraph, f"{{{WORD_NS}}}r")
+    ET.SubElement(run, f"{{{WORD_NS}}}fldChar", {f"{{{WORD_NS}}}fldCharType": "end"})
 
 
 # 获取部件自己的关系文件路径
@@ -237,34 +269,44 @@ def add_header_footer_relationship(rels_xml: bytes, kind: str, rel_id: str, part
 
 # 确保正文分节设置引用指定页眉或页脚
 def ensure_header_footer_reference(document_xml: bytes, kind: str, rel_id: str) -> tuple[bytes, bool]:
-    root = parse_xml(document_xml)
-    body = root.find(f".//{{{WORD_NS}}}body")
-    if body is None:
+    root = minidom.parseString(document_xml)
+    bodies = root.getElementsByTagNameNS(WORD_NS, "body")
+    if not bodies:
         return document_xml, False
 
     changed = False
-    sections = list(root.iter(f"{{{WORD_NS}}}sectPr"))
+    sections = list(root.getElementsByTagNameNS(WORD_NS, "sectPr"))
     reference_tag = HEADER_FOOTER_CONFIGS[kind]["reference_tag"]
     if not sections:
-        sections = [ET.SubElement(body, f"{{{WORD_NS}}}sectPr")]
+        section = root.createElementNS(WORD_NS, "w:sectPr")
+        section.setAttribute("xmlns:w", WORD_NS)
+        bodies[0].appendChild(section)
+        sections = [section]
         changed = True
 
     # 每个分节都要有默认引用，避免只有部分页面生效
     for section in sections:
-        default_reference = None
-        for child in section:
-            if child.tag.rsplit("}", 1)[-1] == reference_tag and child.attrib.get(WORD_TYPE_ATTR, "default") == "default":
-                default_reference = child
-                break
-        if default_reference is None:
-            default_reference = ET.Element(f"{{{WORD_NS}}}{reference_tag}", {WORD_TYPE_ATTR: "default", REL_ATTR: rel_id})
-            section.insert(0, default_reference)
-            changed = True
-        elif default_reference.attrib.get(REL_ATTR) != rel_id:
-            default_reference.set(REL_ATTR, rel_id)
-            changed = True
+        for page_type in ("default", "first", "even"):
+            reference = next((child for child in section.childNodes
+                              if child.namespaceURI == WORD_NS and child.localName == reference_tag
+                              and (child.getAttributeNS(WORD_NS, "type") or "default") == page_type), None)
+            if reference is None:
+                reference = root.createElementNS(WORD_NS, f"w:{reference_tag}")
+                reference.setAttribute("xmlns:w", WORD_NS)
+                reference.setAttribute("xmlns:r", OFFICE_REL_NS)
+                reference.setAttributeNS(WORD_NS, "w:type", page_type)
+                reference.setAttributeNS(OFFICE_REL_NS, "r:id", rel_id)
+                anchor = next((child for child in section.childNodes if child.nodeType == child.ELEMENT_NODE
+                               and not (kind == "footer" and child.namespaceURI == WORD_NS
+                                        and child.localName in {"headerReference", "footerReference"})), None)
+                section.insertBefore(reference, anchor)
+                changed = True
+            elif reference.getAttributeNS(OFFICE_REL_NS, "id") != rel_id:
+                reference.setAttribute("xmlns:r", OFFICE_REL_NS)
+                reference.setAttributeNS(OFFICE_REL_NS, "r:id", rel_id)
+                changed = True
 
-    return xml_to_bytes(root), changed
+    return (root.toxml(encoding="utf-8") if changed else document_xml), changed
 
 
 # 确保内容类型表声明了页眉或页脚文件
@@ -312,6 +354,11 @@ def prepare_header_footer_update(
                 replacements[part_target] = part_bytes
             else:
                 new_files[part_target] = part_bytes
+        rels_root = parse_xml(rels_xml)
+        rel_id = next(r.attrib["Id"] for r in rels_root
+                      if r.attrib.get("Type") == HEADER_FOOTER_CONFIGS[kind]["rel_type"])
+        document_xml, references_changed = ensure_header_footer_reference(document_xml, kind, rel_id)
+        changed = changed or references_changed
     else:
         known_names = names | set(new_files)
         part_name = build_header_footer_part_name(kind, known_names)
@@ -326,30 +373,57 @@ def prepare_header_footer_update(
     return document_xml, rels_xml, part_targets, changed
 
 
+# 修复旧版本重写正文时遗失的已知兼容前缀声明
+def repair_legacy_compatibility(document_xml: bytes) -> tuple[bytes, bool]:
+    namespaces = {
+        "w14": "http://schemas.microsoft.com/office/word/2010/wordml",
+        "w15": "http://schemas.microsoft.com/office/word/2012/wordml",
+        "wp14": "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing",
+    }
+    root = minidom.parseString(document_xml)
+    changed = False
+    for element in root.getElementsByTagName("*"):
+        prefixes = element.getAttributeNS("http://schemas.openxmlformats.org/markup-compatibility/2006", "Ignorable").split()
+        for prefix in prefixes:
+            if prefix not in namespaces:
+                continue
+            ancestor = element
+            while ancestor.nodeType == ancestor.ELEMENT_NODE:
+                if ancestor.hasAttribute("xmlns:" + prefix):
+                    break
+                ancestor = ancestor.parentNode
+            else:
+                element.setAttribute("xmlns:" + prefix, namespaces[prefix])
+                changed = True
+    return (root.toxml(encoding="utf-8") if changed else document_xml), changed
+
+
 # 移除 document.xml 中的页眉或页脚引用
 def remove_section_references(document_xml: bytes, mode: str) -> tuple[bytes, set[str], bool]:
-    root = parse_xml(document_xml)
+    root = minidom.parseString(document_xml)
     removed_ids: set[str] = set()
     changed = False
 
     # 遍历每个分节设置，删除对应的页眉页脚引用
-    for section in root.iter(f"{{{WORD_NS}}}sectPr"):
-        for child in list(section):
-            tag_name = child.tag.rsplit("}", 1)[-1]
+    for section in root.getElementsByTagNameNS(WORD_NS, "sectPr"):
+        for child in list(section.childNodes):
+            if child.namespaceURI != WORD_NS:
+                continue
+            tag_name = child.localName
             if tag_name == "headerReference" and should_remove("header", mode):
-                rel_id = child.attrib.get(REL_ATTR)
+                rel_id = child.getAttributeNS(OFFICE_REL_NS, "id")
                 if rel_id:
                     removed_ids.add(rel_id)
-                section.remove(child)
+                section.removeChild(child)
                 changed = True
             elif tag_name == "footerReference" and should_remove("footer", mode):
-                rel_id = child.attrib.get(REL_ATTR)
+                rel_id = child.getAttributeNS(OFFICE_REL_NS, "id")
                 if rel_id:
                     removed_ids.add(rel_id)
-                section.remove(child)
+                section.removeChild(child)
                 changed = True
 
-    return xml_to_bytes(root), removed_ids, changed
+    return (root.toxml(encoding="utf-8") if changed else document_xml), removed_ids, changed
 
 
 # 移除 Word 关系文件中对应的页眉页脚关系
@@ -431,6 +505,12 @@ def process_docx(
     header_alignment: str = "left",
     footer_alignment: str = "right",
 ) -> ProcessResult:
+    # 显式空白页眉页脚阻止首页和偶数页自动套用带横线的默认样式
+    if header_text is None and footer_text is None:
+        if should_remove("header", mode):
+            header_text = ""
+        if should_remove("footer", mode):
+            footer_text = ""
     if source.name.startswith("~$"):
         return ProcessResult(source, None, False, "跳过 Word 临时文件")
     if source.suffix.lower() not in WORD_EXTENSIONS:
@@ -455,6 +535,7 @@ def process_docx(
             obsolete_paths: set[str] = set()
             text_changed = False
             document_bytes = zin.read("word/document.xml")
+            document_bytes, compatibility_changed = repair_legacy_compatibility(document_bytes)
             rels_bytes = zin.read("word/_rels/document.xml.rels")
 
             if header_text is None and footer_text is None:
@@ -543,7 +624,8 @@ def process_docx(
                 content_types_changed = False
 
             changed = (
-                document_changed
+                compatibility_changed
+                or document_changed
                 or rels_changed
                 or content_types_changed
                 or text_changed

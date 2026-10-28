@@ -248,6 +248,8 @@ class HeaderFooterCleanerApp:
 
         recursive_row = Frame(panel)
         recursive_row.pack(fill="x", pady=(10, 0))
+        Button(recursive_row, text="插入总页数", command=lambda: self._insert_footer_token("{NUMPAGES}")).pack(side="right")
+        Button(recursive_row, text="插入页码", command=lambda: self._insert_footer_token("{PAGE}")).pack(side="right", padx=(8, 8))
 
         Radiobutton(
             recursive_row,
@@ -261,6 +263,15 @@ class HeaderFooterCleanerApp:
             value=False,
             variable=self.recursive_var,
         ).pack(side="left", padx=(18, 0))
+
+    # 在光标处插入页码标记并选中页脚修改模式
+    def _insert_footer_token(self, token: str) -> None:
+        if self.footer_entry.selection_present():
+            self.footer_entry.delete("sel.first", "sel.last")
+        self.footer_entry.insert("insert", token)
+        self.footer_entry.focus_set()
+        if self.mode_var.get() != "set_both":
+            self.mode_var.set("set_footer")
 
     # 创建操作按钮和进度条
     def _build_action_panel(self, parent: Frame) -> None:
@@ -587,18 +598,19 @@ def run_self_test() -> int:
         return 1
 
     with zipfile.ZipFile(source) as zf:
-        names = set(zf.namelist())
-        combined = "\n".join(
-            zf.read(name).decode("utf-8", errors="ignore")
-            for name in zf.namelist()
-            if name.endswith(".xml") or name.endswith(".rels")
-        ) + "\n" + "\n".join(names)
-
-    if "footerReference" in combined or "word/footer1.xml" in combined:
-        print("SELF TEST FAIL: 页脚仍然存在")
+        footer = ET.fromstring(zf.read("word/footer1.xml"))
+        header = ET.fromstring(zf.read("word/header1.xml"))
+        document = ET.fromstring(zf.read("word/document.xml"))
+    if list(footer.iter(f"{{{WORD_NS}}}t")) or list(footer.iter(f"{{{WORD_NS}}}instrText")):
+        print("SELF TEST FAIL: 页脚内容仍然存在")
         return 1
-    if "headerReference" not in combined or "word/header1.xml" not in combined:
+    if not list(header.iter(f"{{{WORD_NS}}}t")):
         print("SELF TEST FAIL: 页眉被误删")
+        return 1
+    types = {node.get(f"{{{WORD_NS}}}type") for node in document.iter(f"{{{WORD_NS}}}footerReference")}
+    bottom = footer.find(f".//{{{WORD_NS}}}pBdr/{{{WORD_NS}}}bottom")
+    if types != {"default", "first", "even"} or bottom is None or bottom.get(f"{{{WORD_NS}}}val") != "nil":
+        print("SELF TEST FAIL: 首页或奇偶页未清空")
         return 1
 
     update_source = sample_dir / "update_sample.docx"
@@ -609,7 +621,7 @@ def run_self_test() -> int:
         None,
         True,
         header_text="测试修改页眉",
-        footer_text="测试修改页脚",
+        footer_text="第 {PAGE} 页 / 共 {NUMPAGES} 页",
         header_alignment="center",
         footer_alignment="left",
     )
@@ -625,8 +637,12 @@ def run_self_test() -> int:
         header_alignment = header_root.find(f".//{{{WORD_NS}}}p/{{{WORD_NS}}}pPr/{{{WORD_NS}}}jc")
         footer_alignment = footer_root.find(f".//{{{WORD_NS}}}p/{{{WORD_NS}}}pPr/{{{WORD_NS}}}jc")
 
-    if footer_text != "测试修改页脚":
+    if footer_text != "第 1 页 / 共 1 页":
         print("SELF TEST FAIL: 页脚内容未修改")
+        return 1
+    instructions = [node.text.strip() for node in footer_root.iter(f"{{{WORD_NS}}}instrText")]
+    if instructions != ["PAGE", "NUMPAGES"]:
+        print("SELF TEST FAIL: 自动页码未写入")
         return 1
     if header_alignment is None or header_alignment.attrib.get(f"{{{WORD_NS}}}val") != "center":
         print("SELF TEST FAIL: 页眉未居中")
