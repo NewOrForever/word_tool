@@ -77,6 +77,7 @@ MODE_LABELS = {
     "set_header": "修改/增加页眉",
     "set_footer": "修改/增加页脚",
     "set_both": "页眉页脚都修改",
+    "last_page_images": "删除最后一页图片",
 }
 # 界面位置文字和文档对齐值的对应关系
 ALIGNMENT_LABELS = {"左边": "left", "居中": "center", "右边": "right"}
@@ -130,8 +131,8 @@ class HeaderFooterCleanerApp:
         self.worker_thread: threading.Thread | None = None
 
         self.root.title(APP_TITLE)
-        self.root.geometry("760x560")
-        self.root.minsize(720, 520)
+        self.root.geometry("760x640")
+        self.root.minsize(720, 600)
         self.root.resizable(True, True)
 
         self._configure_style()
@@ -211,8 +212,12 @@ class HeaderFooterCleanerApp:
         mode_row = Frame(panel)
         mode_row.pack(fill="x")
 
-        for mode, label in MODE_LABELS.items():
-            Radiobutton(mode_row, text=label, value=mode, variable=self.mode_var).pack(side="left", padx=(0, 18))
+        for index, (mode, label) in enumerate(MODE_LABELS.items()):
+            Radiobutton(mode_row, text=label, value=mode, variable=self.mode_var).grid(
+                row=index // 3, column=index % 3, sticky="w", padx=(0, 18))
+
+        Label(panel, text="支持 doc/docx；doc 和删除末页正文图片需要本机 Word 或支持自动化的 WPS", fg="#777777").pack(
+            anchor="w", pady=(4, 0))
 
         header_row = Frame(panel)
         header_row.pack(fill="x", pady=(10, 0))
@@ -306,7 +311,7 @@ class HeaderFooterCleanerApp:
             selected = filedialog.askopenfilename(
                 title="选择 Word 文件",
                 filetypes=[
-                    ("Word 文件", "*.docx *.docm *.dotx *.dotm"),
+                    ("Word 文件", "*.doc *.docx *.docm *.dotx *.dotm"),
                     ("所有文件", "*.*"),
                 ],
             )
@@ -513,7 +518,7 @@ class HeaderFooterCleanerApp:
         try:
             targets = collect_targets(target, recursive)
             if not targets:
-                self.message_queue.put(("error", "没有找到可处理的新版 Word 文件"))
+                self.message_queue.put(("error", "没有找到可处理的 Word 文件（doc/docx/docm/dotx/dotm）"))
                 return
 
             success_count = 0
@@ -533,7 +538,7 @@ class HeaderFooterCleanerApp:
                 )
                 if result.changed:
                     success_count += 1
-                    self.message_queue.put(("log", f"[成功] {source}"))
+                    self.message_queue.put(("log", f"[成功] {source}：{result.message}"))
                 else:
                     skip_count += 1
                     self.message_queue.put(("log", f"[跳过] {source}：{result.message}"))

@@ -28,7 +28,7 @@ HEADER_REL_TYPE = f"{OFFICE_REL_NS}/header"
 FOOTER_REL_TYPE = f"{OFFICE_REL_NS}/footer"
 HEADER_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"
 FOOTER_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
-WORD_EXTENSIONS = {".docx", ".docm", ".dotx", ".dotm"}
+WORD_EXTENSIONS = {".doc", ".docx", ".docm", ".dotx", ".dotm"}
 # 支持的页眉页脚对齐方式
 ALIGNMENT_VALUES = {"left", "center", "right"}
 HEADER_FOOTER_CONFIGS = {
@@ -484,6 +484,7 @@ def build_output_path(source: Path, output_dir: Path | None, mode: str) -> Path:
         "set_header": "header_updated",
         "set_footer": "footer_updated",
         "set_both": "header_footer_updated",
+        "last_page_images": "no_last_page_images",
     }
     target_dir = output_dir if output_dir else source.parent
     candidate = target_dir / f"{source.stem}_{suffix_map[mode]}{source.suffix}"
@@ -494,7 +495,7 @@ def build_output_path(source: Path, output_dir: Path | None, mode: str) -> Path:
     return candidate
 
 
-# 处理单个 docx 文件
+# 保留现有调用入口；旧版 doc 和末页图片处理使用桌面排版引擎
 def process_docx(
     source: Path,
     mode: str,
@@ -514,7 +515,17 @@ def process_docx(
     if source.name.startswith("~$"):
         return ProcessResult(source, None, False, "跳过 Word 临时文件")
     if source.suffix.lower() not in WORD_EXTENSIONS:
-        return ProcessResult(source, None, False, "跳过非新版 Word 文件")
+        return ProcessResult(source, None, False, "跳过不支持的 Word 文件")
+    if source.suffix.lower() == '.doc' or mode == 'last_page_images':
+        from word_automation import process_with_office
+        output = source if in_place else build_output_path(source, output_dir, mode)
+        try:
+            changed, message = process_with_office(
+                source, output, mode, header_text, footer_text,
+                header_alignment, footer_alignment)
+            return ProcessResult(source, output if changed else None, changed, message)
+        except Exception as exc:
+            return ProcessResult(source, None, False, f"处理失败：{exc}")
     if not zipfile.is_zipfile(source):
         return ProcessResult(source, None, False, "文件不是有效的 docx")
 
@@ -692,14 +703,14 @@ def print_results(results: Iterable[ProcessResult]) -> int:
 # 构建命令行参数
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="批量移除新版 Word 文件的页眉和页脚",
+        description="批量处理 Word 页眉页脚或删除最后一页正文图片；doc 和末页图片功能需要本机 Word/WPS",
     )
-    parser.add_argument("target", help="单个新版 Word 文件路径，或包含新版 Word 文件的目录路径")
+    parser.add_argument("target", help="单个 Word 文件路径（含 doc/docx），或包含 Word 文件的目录路径")
     parser.add_argument(
         "--mode",
-        choices=("header", "footer", "both", "set_header", "set_footer", "set_both"),
+        choices=("header", "footer", "both", "set_header", "set_footer", "set_both", "last_page_images"),
         default="both",
-        help="header 只去页眉，footer 只去页脚，both 两者都去，set_header 修改或新增页眉，set_footer 修改或新增页脚，set_both 两者都修改，默认 both",
+        help="header 只去页眉，footer 只去页脚，both 两者都去，set_header 修改或新增页眉，set_footer 修改或新增页脚，set_both 两者都修改，last_page_images 删除最后一页正文图片，默认 both",
     )
     parser.add_argument(
         "--header-text",
@@ -743,6 +754,8 @@ def main() -> int:
     in_place = args.in_place or output_dir is None
 
     mode = args.mode
+    if mode == 'last_page_images' and (args.header_text is not None or args.footer_text is not None):
+        parser.error("删除末页图片模式不能同时指定页眉或页脚内容")
     if args.header_text is not None and args.footer_text is not None:
         mode = "set_both"
     elif args.header_text is not None:
@@ -764,7 +777,7 @@ def main() -> int:
         return 2
 
     if not targets:
-        print("没有找到可处理的 docx 文件", file=sys.stderr)
+        print("没有找到可处理的 Word 文件（doc/docx/docm/dotx/dotm）", file=sys.stderr)
         return 1
 
     results = [
